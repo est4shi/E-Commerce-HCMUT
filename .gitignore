@@ -1,0 +1,6 @@
+# Kaggle raw data and ETL output (multi-GB, regenerate with src/etl/etl.py)
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+*.csv

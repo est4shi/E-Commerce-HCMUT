@@ -79,7 +79,7 @@ CREATE TABLE perceived_colour_master (
 
 CREATE TABLE department (
     department_no    INT          PRIMARY KEY,
-    department_name  VARCHAR(50)  NOT NULL UNIQUE
+    department_name  VARCHAR(50)  NOT NULL   -- không UNIQUE: 22 tên dùng chung cho 71 department_no
 );
 
 CREATE TABLE garment_group (
