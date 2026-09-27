@@ -1,6 +1,12 @@
-# Kaggle raw data and ETL output (multi-GB, regenerate with src/etl/etl.py)
+# Kaggle raw data and ETL output (multi-GB; regenerate with src/etl/etl.py)
 data/raw/*
 data/processed/*
 !data/raw/.gitkeep
 !data/processed/.gitkeep
-*.csv
+
+# Office lock files
+~$*
+
+# Python bytecode
+__pycache__/
+*.pyc
