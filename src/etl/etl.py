@@ -1,18 +1,14 @@
 """Phase 3 ETL for the H&M Personalized Fashion Recommendations dataset.
 
-Scope (Plan.xlsx, Phase 3): read the raw CSVs with pandas, then profiling,
-cleaning, standardization, transformation according to the mapping in
-Data_Dictionary.docx, and validation against Database/postgresql/schema.sql.
-Loading into PostgreSQL, indexing, BigQuery, Power BI and testing belong to
-other tasks and are not done here.
+Reads data/raw/{articles,customers,transactions_train}.csv (never modified), profiles,
+cleans and standardizes them, maps them onto the tables of Database/postgresql/schema.sql
+as described in Data_Dictionary.docx, validates the result against that schema, and
+writes data/processed/<table>.csv in the schema's column order.
 
-Input : data/raw/{articles,customers,transactions_train}.csv (only read, never modified)
-Output: data/processed/<table>.csv, one file per schema table with the schema's
-        column order, and data/processed/etl_report.md (what every step found).
-        Tables are only written when every validation check passes; if a check
-        fails, the previous run's tables are removed so they cannot be used by mistake.
-
-The pipeline is repeatable: the same input always gives the same output,
+This is a one-time migration of the Kaggle history (Data Dictionary, Ghi chú A). A run
+first deletes the tables of any earlier run and writes new ones only if every validation
+check passes; it ends by logging "done". Profiling results and failed checks go to the
+console. Rerunning on the same input, on the same machine, gives the same output,
 including the generated transaction_ids.
 
 Usage:
@@ -21,8 +17,6 @@ Usage:
 
 import argparse
 import logging
-import os
-import shutil
 import uuid
 from pathlib import Path
 
@@ -35,9 +29,6 @@ RAW_FILES = ("articles.csv", "customers.csv", "transactions_train.csv")
 
 # Fixed seed so transaction_ids are identical on every run (repeatable pipeline).
 UUID_SEED = 3127
-
-# Profiling flags contains lines built from more source rows than this, for a manual look.
-MANY_REPEATS = 100
 
 log = logging.getLogger("etl")
 
@@ -61,38 +52,21 @@ ARTICLE_INT_COLS = [
     "index_group_no", "section_no", "garment_group_no",
 ]
 
-
-class Report:
-    """Collects what each step found or changed; saved as etl_report.md."""
-
-    def __init__(self) -> None:
-        self.lines: list[str] = []
-
-    def section(self, title: str) -> None:
-        self.lines += ["", f"## {title}", ""]
-        log.info("== %s", title)
-
-    def add(self, msg: str, *args, level: int = logging.INFO) -> None:
-        text = msg % args if args else msg
-        self.lines.append(f"- {text}")
-        log.log(level, text)
-
-    def write(self, path: Path) -> None:
-        path.write_text("# ETL report\n" + "\n".join(self.lines) + "\n", encoding="utf-8")
+# FN / Active: the source holds 1.0 when the flag is set and leaves the cell empty otherwise.
+FLAG = {"1.0": True, "1": True, "0.0": False, "0": False}
 
 
 # ----------------------------------------------------------------------------
 # 1. Read CSV
 # ----------------------------------------------------------------------------
-def read_raw(report: Report) -> dict[str, pd.DataFrame]:
-    report.section("1. Read CSV")
+def read_raw() -> dict[str, pd.DataFrame]:
     missing = [f for f in RAW_FILES if not (RAW_DIR / f).exists()]
     if missing:
         raise FileNotFoundError(f"missing in {RAW_DIR}: {missing}")
 
     # Everything as str so codes keep their leading zeros (article_id "0108775015").
     as_str = dict(dtype=str, keep_default_na=False, na_values=[""])
-    raw = {
+    return {
         "articles": pd.read_csv(RAW_DIR / "articles.csv", **as_str),
         "customers": pd.read_csv(RAW_DIR / "customers.csv", **as_str),
         # ~32M rows: categoricals keep the 64-char ids at a few bytes per row.
@@ -103,174 +77,110 @@ def read_raw(report: Report) -> dict[str, pd.DataFrame]:
             parse_dates=["t_dat"], date_format="%Y-%m-%d",
         ),
     }
-    for name, df in raw.items():
-        report.add("%s: %d rows x %d columns", name, len(df), df.shape[1])
-    return raw
 
 
 # ----------------------------------------------------------------------------
 # 2. Profiling
 # ----------------------------------------------------------------------------
-def profile(raw: dict[str, pd.DataFrame], report: Report) -> None:
-    report.section("2. Profiling (raw data)")
+def profile(raw: dict[str, pd.DataFrame]) -> None:
+    """Log what the raw data looks like: the facts the cleaning and the mapping rely on."""
     a, c, t = raw["articles"], raw["customers"], raw["transactions"]
 
     for name, df in raw.items():
         nulls = df.isna().sum()
-        report.add("%s nulls: %s", name, nulls[nulls > 0].to_dict() or "none")
-
-    report.add("articles: duplicate article_id = %d", a["article_id"].duplicated().sum())
-    report.add("customers: duplicate customer_id = %d", c["customer_id"].duplicated().sum())
+        log.info("%s: %d rows, nulls: %s", name, len(df), nulls[nulls > 0].to_dict() or "none")
+    log.info("duplicate ids: articles %d, customers %d",
+             a["article_id"].duplicated().sum(), c["customer_id"].duplicated().sum())
     for col in ("FN", "Active", "club_member_status", "fashion_news_frequency"):
-        report.add("customers.%s values: %s", col, c[col].value_counts(dropna=False).to_dict())
+        log.info("customers.%s values: %s", col, c[col].value_counts(dropna=False).to_dict())
     age = pd.to_numeric(c["age"], errors="coerce")
-    report.add("customers.age: min %s, max %s", age.min(), age.max())
+    log.info("customers.age: %s .. %s", age.min(), age.max())
 
     # Code -> description must be 1:1 for the lookup tables of the mapping.
     for key, cols in [("product_code", ["prod_name", "product_type_no"]), *LOOKUPS.values()]:
         for col in cols:
             n = (a.groupby(key)[col].nunique() > 1).sum()
-            report.add("articles: %s with >1 %s = %d", key, col, n,
-                       level=logging.WARNING if n else logging.INFO)
-    for key, cols in LOOKUPS.values():
-        n = (a.groupby(cols[0])[key].nunique() > 1).sum()
-        if n:
-            report.add("articles: %s shared by >1 %s = %d", cols[0], key, n)
+            if n:
+                log.warning("articles: %d %s values have more than one %s", n, key, col)
 
-    report.add("transactions: t_dat %s .. %s", t["t_dat"].min(), t["t_dat"].max())
-    report.add("transactions: price min %.6f, median %.6f, max %.6f",
-               t["price"].min(), t["price"].median(), t["price"].max())
-    report.add("transactions: sales_channel_id values %s",
-               t["sales_channel_id"].value_counts(dropna=False).to_dict())
+    log.info("transactions: t_dat %s .. %s, price %.6f .. %.6f (median %.6f), sales_channel_id %s",
+             t["t_dat"].min(), t["t_dat"].max(), t["price"].min(), t["price"].max(), t["price"].median(),
+             t["sales_channel_id"].value_counts(dropna=False).to_dict())
 
     # Rows with the same customer/day/channel/article become one contains line.
     rows_per_line = t.groupby(["customer_id", "t_dat", "sales_channel_id", "article_id"], observed=True).size()
-    report.add("transactions: %d rows repeat the customer/day/channel/article of another row and are merged "
-               "into contains lines (quantity > 1); %d of them are exact duplicates, the rest differ in price",
-               rows_per_line.sum() - len(rows_per_line), t.duplicated().sum())
     _, top_day, _, top_article = rows_per_line.idxmax()
-    report.add("transactions: largest line = %d rows (article %s on %s); lines with more than %d rows = %d",
-               rows_per_line.max(), top_article, str(top_day)[:10], MANY_REPEATS,
-               (rows_per_line > MANY_REPEATS).sum(),
-               level=logging.WARNING if rows_per_line.max() > MANY_REPEATS else logging.INFO)
+    log.info("transactions: %d rows merge into the contains line of another row (%d exact duplicates, "
+             "the rest differ in price); largest line %d rows (article %s on %s)",
+             rows_per_line.sum() - len(rows_per_line), t.duplicated().sum(),
+             rows_per_line.max(), top_article, str(top_day)[:10])
 
 
 # ----------------------------------------------------------------------------
 # 3. Cleaning
 # ----------------------------------------------------------------------------
-def _strip_text(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+def _strip_text(df: pd.DataFrame) -> pd.DataFrame:
     """Trim whitespace in every text column; whitespace-only values become missing."""
-    df = df.copy()
-    changed = 0
-    for col in df.columns:
-        s = df[col].str.strip()
-        s = s.mask(s == "")
-        changed += int((df[col].notna() & (s != df[col])).sum())
-        df[col] = s
-    return df, changed
+    df = df.apply(lambda s: s.str.strip())
+    return df.mask(df == "")
 
 
-def _strip_category(s: pd.Series) -> tuple[pd.Series, int]:
+def _strip_category(s: pd.Series) -> pd.Series:
     """Trim whitespace in a categorical column (only the categories are touched)."""
-    cats = s.cat.categories
-    stripped = cats.str.strip()
-    changed = np.flatnonzero(stripped != cats)
-    if len(changed) == 0:
-        return s, 0
-    n = int(s.cat.codes.isin(changed).sum())
+    stripped = s.cat.categories.str.strip()
     if stripped.is_unique:
-        return s.cat.rename_categories(stripped), n
-    return s.astype("string").str.strip().astype("category"), n
+        return s.cat.rename_categories(stripped)
+    return s.astype("string").str.strip().astype("category")
 
 
-def clean(raw: dict[str, pd.DataFrame], report: Report):
-    report.section("3. Cleaning")
+def clean(raw: dict[str, pd.DataFrame]):
     # Whitespace is trimmed first, so the duplicate and cross-file key checks compare clean ids.
-
-    a, n = _strip_text(raw["articles"])
-    report.add("articles: trimmed whitespace in %d values", n)
+    a = _strip_text(raw["articles"])
     codes = a[ARTICLE_INT_COLS].apply(pd.to_numeric, errors="coerce")
     bad = a["article_id"].isna() | codes.isna().any(axis=1) | (codes % 1 != 0).any(axis=1)
-    report.add("articles: missing article_id or missing/non-integer code = %d rows dropped", bad.sum())
-    a = a.loc[~bad]
-    n_before = len(a)
-    a = a.drop_duplicates("article_id")
-    report.add("articles: dropped %d duplicate article_id rows", n_before - len(a))
+    a = a.loc[~bad].drop_duplicates("article_id")
 
-    c, n = _strip_text(raw["customers"])
-    report.add("customers: trimmed whitespace in %d values", n)
-    missing = c["customer_id"].isna()
-    report.add("customers: missing customer_id = %d rows dropped", missing.sum())
-    c = c.loc[~missing]
-    n_before = len(c)
-    c = c.drop_duplicates("customer_id").copy()
-    report.add("customers: dropped %d duplicate customer_id rows", n_before - len(c))
+    c = _strip_text(raw["customers"])
+    c = c.dropna(subset=["customer_id"]).drop_duplicates("customer_id")
     age = pd.to_numeric(c["age"], errors="coerce")
-    not_whole = c["age"].notna() & (age.isna() | (age % 1 != 0))
-    out_of_range = ~not_whole & age.notna() & ~age.between(0, 120)
-    c["age"] = age.mask(not_whole | out_of_range)
-    report.add("customers: age not a whole number -> NULL = %d", not_whole.sum())
-    report.add("customers: age outside 0..120 -> NULL = %d", out_of_range.sum())
+    c = c.assign(age=age.where((age % 1 == 0) & age.between(0, 120)))  # anything else -> NULL
 
     t = raw["transactions"]
-    customer_id, n_c = _strip_category(t["customer_id"])
-    article_id, n_a = _strip_category(t["article_id"])
-    report.add("transactions: trimmed whitespace in %d ids", n_c + n_a)
-    t = t.assign(customer_id=customer_id, article_id=article_id,
+    t = t.assign(customer_id=_strip_category(t["customer_id"]), article_id=_strip_category(t["article_id"]),
                  t_dat=pd.to_datetime(t["t_dat"], errors="coerce", format="%Y-%m-%d"))
-    rules = {
-        "missing customer_id/article_id/t_dat/price": (
-            t["customer_id"].isna() | t["article_id"].isna() | t["t_dat"].isna() | t["price"].isna()),
-        "sales_channel_id not in (1, 2)": ~t["sales_channel_id"].isin([1, 2]),
-        "price < 0": t["price"] < 0,
-        "customer_id not in customers.csv": ~t["customer_id"].isin(c["customer_id"]),
-        "article_id not in articles.csv": ~t["article_id"].isin(a["article_id"]),
-    }
-    drop = pd.Series(False, index=t.index)
-    for rule, mask in rules.items():
-        mask = mask.fillna(True)
-        report.add("transactions: %s = %d rows", rule, mask.sum())
-        drop |= mask
-    t = t.loc[~drop]
-    report.add("transactions: dropped %d rows, %d remain", drop.sum(), len(t))
+    bad = (t[["customer_id", "article_id", "t_dat", "price"]].isna().any(axis=1)
+           | ~t["sales_channel_id"].isin([1, 2])
+           | (t["price"] < 0)
+           | ~t["customer_id"].isin(c["customer_id"])
+           | ~t["article_id"].isin(a["article_id"]))
+    t = t.loc[~bad]
+
+    log.info("cleaning dropped %d articles, %d customers and %d transactions",
+             len(raw["articles"]) - len(a), len(raw["customers"]) - len(c), len(raw["transactions"]) - len(t))
     return a, c, t
 
 
 # ----------------------------------------------------------------------------
 # 4. Standardization
 # ----------------------------------------------------------------------------
-def _flag(s: pd.Series, name: str, report: Report) -> pd.Series:
-    """The source fills FN/Active with 1.0 when set and leaves them empty otherwise:
-    1.0 -> true, empty -> false. Anything else is unexpected and becomes NULL."""
-    known = s.map({"1.0": True, "1": True, "0.0": False, "0": False})
-    unexpected = s.notna() & known.isna()
-    out = known.mask(s.isna(), False).astype("boolean")
-    report.add("customers.%s: %d true, %d false, %d unexpected values -> NULL", name,
-               out.sum(), (~out).sum(), unexpected.sum(),
-               level=logging.WARNING if unexpected.any() else logging.INFO)
-    return out
+def _flag(s: pd.Series) -> pd.Series:
+    """1.0 -> true, empty -> false; any other value is unexpected and becomes NULL."""
+    return s.map(FLAG).mask(s.isna(), False).astype("boolean")
 
 
-def standardize(a: pd.DataFrame, c: pd.DataFrame, report: Report):
-    report.section("4. Standardization")
-
+def standardize(a: pd.DataFrame, c: pd.DataFrame):
     a = a.copy()
-    for col in ARTICLE_INT_COLS:
-        a[col] = pd.to_numeric(a[col]).astype("int64")
-    report.add("articles: %d code columns converted to integers; article_id kept as 10-char text",
-               len(ARTICLE_INT_COLS))
+    a[ARTICLE_INT_COLS] = a[ARTICLE_INT_COLS].apply(pd.to_numeric).astype("int64")
 
-    news = c["fashion_news_frequency"]
     customer = pd.DataFrame({
         "customer_id": c["customer_id"],
         "age": c["age"].astype("Int16"),
-        "fn": _flag(c["FN"], "FN", report),
-        "active": _flag(c["Active"], "Active", report),
+        "fn": _flag(c["FN"]),
+        "active": _flag(c["Active"]),
         "club_member_status": c["club_member_status"],
-        "fashion_news_frequency": news.replace({"None": "NONE"}),
+        "fashion_news_frequency": c["fashion_news_frequency"].replace({"None": "NONE"}),
         "postal_code": c["postal_code"],
     })
-    report.add("customers.fashion_news_frequency: 'None' -> 'NONE' = %d", (news == "None").sum())
     return a, customer
 
 
@@ -301,7 +211,7 @@ def _repeatable_uuid4(n: int) -> np.ndarray:
     return np.array([str(uuid.UUID(bytes=row.tobytes())) for row in b], dtype=object)
 
 
-def transform_articles(a: pd.DataFrame, report: Report) -> dict[str, pd.DataFrame]:
+def transform_articles(a: pd.DataFrame) -> dict[str, pd.DataFrame]:
     tables = {name: _lookup(a, key, cols) for name, (key, cols) in LOOKUPS.items()}
     tables["product_group"] = (
         a[["product_group_name"]].drop_duplicates().sort_values("product_group_name").reset_index(drop=True)
@@ -315,7 +225,6 @@ def transform_articles(a: pd.DataFrame, report: Report) -> dict[str, pd.DataFram
         axis=1,
     ).rename_axis("product_code").reset_index()
     tables["product"] = product.sort_values("product_code").reset_index(drop=True)
-    report.add("product: %d rows (most frequent prod_name / product_type_no per product_code)", len(product))
 
     art = a[[
         "article_id", "detail_desc", "product_code", "graphical_appearance_no",
@@ -331,37 +240,17 @@ def transform_articles(a: pd.DataFrame, report: Report) -> dict[str, pd.DataFram
     return tables
 
 
-def report_product_type_impact(a: pd.DataFrame, tables: dict[str, pd.DataFrame], t: pd.DataFrame,
-                               report: Report) -> None:
-    """Known limitation: schema.sql keeps one product_type_no per product_code (in PRODUCT),
-    but articles.csv sometimes gives articles of the same product different types. Measure
-    how many articles, and how much revenue, end up under another type than their own."""
-    own = a.set_index("article_id")["product_type_no"]
-    kept = a.set_index("article_id")["product_code"].map(
-        tables["product"].set_index("product_code")["product_type_no"])
-    moved = own.index[own != kept]
-    group = tables["product_type"].set_index("product_type_no")["product_group_name"]
-    moved_group = int((own[moved].map(group) != kept[moved].map(group)).sum())
-    share = t.loc[t["article_id"].isin(moved), "price"].sum() / t["price"].sum()
-    report.add("product: %d articles are counted under a different product_type than in articles.csv "
-               "(%d of them under a different product_group), %.2f%% of revenue",
-               len(moved), moved_group, 100 * share,
-               level=logging.WARNING if len(moved) else logging.INFO)
-
-
-def compute_price_base(t: pd.DataFrame, window_days: int, report: Report) -> pd.Series:
+def compute_price_base(t: pd.DataFrame, window_days: int) -> pd.Series:
     """Ghi chú B: median price over the last `window_days` days of the dataset,
     falling back to the all-time median for articles not sold in that window.
     `>= max - window_days` follows the Data Dictionary, so the window spans window_days + 1 dates."""
     cutoff = t["t_dat"].max() - pd.Timedelta(days=window_days)
     recent = t.loc[t["t_dat"] >= cutoff].groupby("article_id", observed=True)["price"].median()
     all_time = t.groupby("article_id", observed=True)["price"].median()
-    report.add("price_base: %d articles from last %d days, %d from all-time median",
-               len(recent), window_days, len(all_time) - len(recent))
     return recent.combine_first(all_time).rename("price_base")
 
 
-def transform_transactions(t: pd.DataFrame, report: Report) -> tuple[pd.DataFrame, pd.DataFrame]:
+def transform_transactions(t: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Ghi chú A: one historical transaction = one (customer_id, t_dat, sales_channel_id).
     tx_idx = t.groupby(["customer_id", "t_dat", "sales_channel_id"], observed=True, sort=False).ngroup().to_numpy()
     n_tx = int(tx_idx.max()) + 1
@@ -379,32 +268,22 @@ def transform_transactions(t: pd.DataFrame, report: Report) -> tuple[pd.DataFram
     # If those rows were sold at different prices, the line price is their average
     # (team decision), so price * quantity still equals the revenue of the source rows.
     lines = pd.DataFrame({"tx": tx_idx, "article_id": t["article_id"].to_numpy(), "price": t["price"].to_numpy()})
-    agg = lines.groupby(["tx", "article_id"], observed=True, sort=False)["price"].agg(["mean", "size", "nunique"])
-    agg = agg.reset_index()
-    report.add("contains: %d lines had differing prices across their rows -> averaged",
-               (agg["nunique"] > 1).sum())
-
+    agg = lines.groupby(["tx", "article_id"], observed=True, sort=False)["price"].agg(["mean", "size"]).reset_index()
     contains = pd.DataFrame({
         "transaction_id": uuids[agg["tx"].to_numpy()],
         "article_id": agg["article_id"].astype(str).to_numpy(),
         "price": agg["mean"].round(10).to_numpy(),
         "quantity": agg["size"].to_numpy(),
     })
-    report.add("transaction: %d rows, contains: %d rows", len(transaction), len(contains))
     return transaction, contains
 
 
-def transform(a, customer, t, window_days: int, report: Report) -> dict[str, pd.DataFrame]:
-    report.section("5. Transformation (Data Dictionary mapping)")
-    tables = transform_articles(a, report)
+def transform(a: pd.DataFrame, customer: pd.DataFrame, t: pd.DataFrame, window_days: int) -> dict[str, pd.DataFrame]:
+    tables = transform_articles(a)
     tables["customer"] = customer
-    report_product_type_impact(a, tables, t, report)
-
     article = tables["article"]
-    article["price_base"] = article["article_id"].map(compute_price_base(t, window_days, report)).round(10)
-    report.add("article: %d rows, %d never sold -> price_base NULL", len(article), article["price_base"].isna().sum())
-
-    tables["transaction"], tables["contains"] = transform_transactions(t, report)
+    article["price_base"] = article["article_id"].map(compute_price_base(t, window_days)).round(10)
+    tables["transaction"], tables["contains"] = transform_transactions(t)
     return tables
 
 
@@ -484,12 +363,11 @@ CHECKS = [
 ]
 
 
-def validate(tables: dict[str, pd.DataFrame], n_source_rows: int, report: Report) -> list[str]:
-    report.section("6. Validation")
+def validate(tables: dict[str, pd.DataFrame], n_source_rows: int) -> list[str]:
+    """Return the checks that fail; empty when the tables match schema.sql."""
     failed: list[str] = []
 
     def check(ok: bool, what: str) -> None:
-        report.add("%s  %s", "PASS" if ok else "FAIL", what, level=logging.INFO if ok else logging.ERROR)
         if not ok:
             failed.append(what)
 
@@ -519,55 +397,36 @@ def validate(tables: dict[str, pd.DataFrame], n_source_rows: int, report: Report
 # ----------------------------------------------------------------------------
 # Output
 # ----------------------------------------------------------------------------
-def write_tables(tables: dict[str, pd.DataFrame], out_dir: Path, report: Report) -> None:
-    """Write every table into a temporary folder and move them into place only when all
-    are written, so a crash never leaves a half-written or mixed set of tables."""
-    report.section("Output")
-    tmp = out_dir / ".tmp"
-    shutil.rmtree(tmp, ignore_errors=True)
-    tmp.mkdir(parents=True)
+def clear_output(out_dir: Path) -> None:
+    """Delete an earlier run's tables before starting, so a failed or crashed run never
+    leaves old and new tables side by side."""
+    for name in SCHEMA:
+        (out_dir / f"{name}.csv").unlink(missing_ok=True)
+
+
+def write_tables(tables: dict[str, pd.DataFrame], out_dir: Path) -> None:
     for name in SCHEMA:  # parents before children
         # Plain decimals (no 1.69e-05), matching DECIMAL(12,10).
-        tables[name].to_csv(tmp / f"{name}.csv", index=False, chunksize=1_000_000, float_format="%.10f")
-        report.add("wrote %s.csv (%d rows)", name, len(tables[name]))
-    for name in SCHEMA:
-        os.replace(tmp / f"{name}.csv", out_dir / f"{name}.csv")
-    tmp.rmdir()
-
-
-def remove_tables(out_dir: Path, report: Report) -> None:
-    """After a failed validation, remove the previous run's tables so they cannot be used by mistake."""
-    report.section("Output")
-    removed = 0
-    for name in SCHEMA:
-        path = out_dir / f"{name}.csv"
-        if path.exists():
-            path.unlink()
-            removed += 1
-    report.add("validation failed: no tables written, %d tables of the previous run removed", removed,
-               level=logging.ERROR)
+        tables[name].to_csv(out_dir / f"{name}.csv", index=False, chunksize=1_000_000, float_format="%.10f")
 
 
 def run(out_dir: Path, window_days: int) -> dict[str, pd.DataFrame]:
     if out_dir.resolve() == RAW_DIR.resolve():
         raise ValueError("--out-dir must not be data/raw: raw files are read-only")
-    report = Report()
-
-    raw = read_raw(report)
-    profile(raw, report)
-    a, c, t = clean(raw, report)
-    del raw
-    a, customer = standardize(a, c, report)
-    tables = transform(a, customer, t, window_days, report)
-    failed = validate(tables, len(t), report)
-
     out_dir.mkdir(parents=True, exist_ok=True)
+    clear_output(out_dir)
+
+    raw = read_raw()
+    profile(raw)
+    a, c, t = clean(raw)
+    del raw
+    a, customer = standardize(a, c)
+    tables = transform(a, customer, t, window_days)
+    failed = validate(tables, len(t))
     if failed:
-        remove_tables(out_dir, report)
-        report.write(out_dir / "etl_report.md")
-        raise SystemExit(f"validation failed ({len(failed)} checks); no tables written, see etl_report.md")
-    write_tables(tables, out_dir, report)
-    report.write(out_dir / "etl_report.md")
+        raise SystemExit("validation failed, no tables written:\n  " + "\n  ".join(failed))
+    write_tables(tables, out_dir)
+    log.info("done: validation passed, %d tables written to %s", len(SCHEMA), out_dir)
     return tables
 
 

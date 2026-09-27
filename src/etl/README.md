@@ -1,103 +1,50 @@
 # ETL (Phase 3)
 
-`etl.py` reads the three Kaggle CSVs with pandas, profiles, cleans and
-standardizes them, transforms them according to `Data_Dictionary.docx`, and
-validates the result against `Database/postgresql/schema.sql`.
-
-It only produces files. `schema.sql` creates the (empty) tables; the ETL
-produces the rows that go into them. Loading into PostgreSQL, indexes,
-BigQuery, Power BI and tests are other tasks of `Plan.xlsx` and are not done
-here.
+`etl.py` builds one CSV per table of `Database/postgresql/schema.sql` from the
+Kaggle files, following `Data_Dictionary.docx`. Below are only how to run it
+and the choices the guideline files leave open.
 
 ## Run
 
-Requires Python 3.10+ and `pip install -r requirements.txt` (pandas, numpy).
-Put the raw files in `data/raw/`, then from the project root:
+With the raw files in `data/raw/`, from the project root:
 
 ```
+pip install -r requirements.txt
 python src/etl/etl.py
 ```
 
-It takes a few minutes and needs a lot of RAM for the 32M transaction rows
-(tested on a 32 GB machine).
+Options: `--out-dir` (default `data/processed`) and `--price-window-days`
+(default 90, the N of Ghi chú B). Tested with Python 3.11, pandas 2.1.4 and
+numpy 1.26.3; it takes a few minutes and needs a lot of RAM (tested with 32 GB).
 
-| Option | Default | |
-|---|---|---|
-| `--out-dir` | `data/processed` | where the table CSVs and report are written |
-| `--price-window-days` | `90` | window for `article.price_base` (Ghi chú B) |
+## Output
 
-## Input and output
+`<table>.csv` for every table except `login_account`: header row, schema
+column order, empty cell = NULL. Load them in the order `schema.sql` creates
+the tables (parents first).
 
-- **Input:** `data/raw/articles.csv`, `customers.csv`, `transactions_train.csv`.
-  They are only read, never modified.
-- **Output:** `data/processed/<table>.csv`, one per table in `schema.sql`
-  (except `login_account`, which is Phase 2 of the Data Dictionary).
-  - Each file has a header row and the same column order as the schema.
-  - Empty cells mean NULL. Prices are written as plain decimals (10 places).
-  - Files are listed parent tables first, so they can be loaded in that order.
-- **`data/processed/etl_report.md`:** what each step found and changed, plus
-  the PASS/FAIL result of every validation check.
+The ETL runs once, so a run simply deletes the tables of any earlier run and
+writes new ones only if every check against `schema.sql` passes. Profiling
+results and failed checks are printed to the console. Load the tables only
+after a run that ended with `done`.
 
-Tables are written only if every check passes. They are written to a temporary
-folder first and moved into place at the end, so a crash never leaves a
-half-written file. If a check fails, the previous run's tables are removed and
-only the report is left.
+## Decisions
 
-The pipeline is repeatable: the same raw files always give the same output,
-including `transaction_id` (UUID v4 format, generated from a fixed seed).
+- **Invalid source rows** (missing or duplicate ids, missing fields, unknown
+  customer/article, invalid code, channel or price) are dropped, and invalid
+  ages become NULL. Anything else that breaks `schema.sql` fails validation.
+- **`product`:** some `product_code`s have articles with different
+  `prod_name`/`product_type_no`; the most frequent is kept. So 501 articles
+  (0.59% of revenue) count under another product type, 137 of them under
+  another product group.
+- **`FN` / `Active`:** empty means false.
+- **`contains.price`:** if the rows merged into one line had different prices,
+  it is their average, so `price * quantity` still equals the revenue.
+- **`price_base`:** falls back to the all-time median; NULL only if the
+  article never sold.
+- **`transaction_id`:** drawn from a fixed seed, the only random step, so a
+  rerun on the same input and machine gives identical output.
+- **`image_path`:** not checked against the image folder; some Kaggle images
+  are missing.
 
-## Steps
-
-1. **Read CSV:** all article/customer columns as text, so leading zeros survive
-   (`article_id` "0108775015").
-2. **Profiling:**
-   - Row counts, nulls, duplicate keys, value sets, and date and price ranges.
-   - Code → name conflicts in `articles.csv`.
-   - How many transaction rows get merged into one `contains` line, and the
-     largest merged line (flagged if it has more than 100 rows).
-3. **Cleaning:** whitespace is trimmed first (ids included), so the key checks
-   compare clean values. Then:
-   - Articles with a missing id or a missing/non-integer code are dropped, and
-     so are duplicate keys.
-   - `age` that is not a whole number or is outside 0..120 becomes NULL.
-   - Transaction rows are dropped if they have a missing field, an invalid
-     channel, a negative price, or an unknown customer/article.
-4. **Standardization:**
-   - Code columns become integers.
-   - `FN`/`Active`: `1.0` → true, empty → false. Other values become NULL and
-     are counted.
-   - `fashion_news_frequency`: `"None"` → `"NONE"`.
-5. **Transformation (Data Dictionary mapping):** produces the rows for every
-   table.
-   - The 11 lookup tables get the distinct code/name pairs from `articles.csv`.
-   - `transaction`: one row per (customer_id, t_dat, sales_channel_id) (Ghi chú A).
-   - `contains.quantity`: the number of rows of the same article in the same transaction.
-   - `article.image_path`: `images/<first 3 chars>/<article_id>.jpg`.
-   - `article.price_base`: 90-day median price, falling back to the all-time
-     median; NULL if the article never sold (Ghi chú B).
-6. **Validation:**
-   - Columns, PRIMARY KEY, NOT NULL, UNIQUE, FOREIGN KEY, CHECK constraints
-     and text lengths, checked against `schema.sql`.
-   - `sum(contains.quantity)` must equal the number of cleaned transaction rows.
-
-If `schema.sql` changes, update `SCHEMA` / `CHECKS` in `etl.py` to match.
-
-## Decisions and known limitations
-
-- **Product type per product:** `schema.sql` stores one `product_type_no` per
-  `product_code` (in `product`). In `articles.csv`, 315 products have articles
-  of different types. The ETL keeps the most frequent type (and name), so a few
-  articles are counted under another type than their own. Last run: 501
-  articles, 137 of them under another product group, 0.59% of revenue. This
-  affects "Revenue by Product Type / Group" slightly. The exact numbers are in
-  `etl_report.md` on every run.
-- **FN / Active:** empty means "no" (false). The source only fills these flags
-  when they are set.
-- **Price of merged lines:** when a customer bought the same article several
-  times on the same day at different prices, `contains.price` is the average
-  (team decision). `price * quantity` still equals the real revenue.
-- **price_base window:** `t_dat >= last date - 90 days`, exactly as in the Data
-  Dictionary, so the window spans 91 dates.
-- **image_path:** built from `article_id` only, as the Data Dictionary defines
-  it. The ETL does not check whether the image file exists. The Kaggle image
-  set is missing some images, so the application has to handle a missing file.
+If `schema.sql` changes, update `SCHEMA` / `CHECKS` in `etl.py`.
